@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "predeploy": "bun run build",
+    "deploy": "gh-pages -d dist",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
   },
   "devDependencies": {
@@ -19,6 +21,7 @@
     "vite": "^8.0.12"
   },
   "dependencies": {
+    "gh-pages": "^6.3.0",
     "peerjs": "^1.5.5"
   }
 }
