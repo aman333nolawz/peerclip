@@ -396,7 +396,7 @@
       <span class="brand-mark">P</span>
       <span>
         <strong>Peerclip</strong>
-        <small>Peer to peer text drop</small>
+        <small>Peer to peer text and file sharing</small>
       </span>
     </a>
 
