@@ -6,6 +6,42 @@
   type Message = {
     sender: "self" | "peer" | "system";
     text: string;
+    file?: FileMessage;
+    uploadProgress?: number;
+  };
+
+  type FileMessage = {
+    name: string;
+    type: string;
+    size: number;
+    dataUrl: string;
+  };
+
+  type FileMeta = Omit<FileMessage, "dataUrl">;
+
+  type PeerPayload =
+    | string
+    | {
+        kind: "file-start";
+        id: string;
+        file: FileMeta;
+      }
+    | {
+        kind: "file-chunk";
+        id: string;
+        chunk: ArrayBuffer;
+        loaded: number;
+        total: number;
+      }
+    | {
+        kind: "file-end";
+        id: string;
+      };
+
+  type IncomingTransfer = {
+    messageIndex: number;
+    chunks: ArrayBuffer[];
+    file: FileMeta;
   };
 
   type Theme = "light" | "dark";
@@ -14,6 +50,7 @@
   let peerId = $state(getId());
   let targetPeerId = $state("");
   let connection = $state<DataConnection>();
+  let fileInput = $state<HTMLInputElement>();
   let messages = $state<Message[]>([]);
   let messageText = $state("");
   let theme = $state<Theme>("dark");
@@ -22,6 +59,9 @@
   );
   let copied = $state(false);
   let copiedMessageIndex = $state<number | null>(null);
+
+  const incomingTransfers = new Map<string, IncomingTransfer>();
+  const fileChunkSize = 64 * 1024;
 
   const statusText = $derived(
     connectionState === "connected"
@@ -128,7 +168,7 @@
     });
 
     conn.on("data", (data: unknown) => {
-      messages.push({ sender: "peer", text: String(data) });
+      handlePeerData(data);
     });
 
     conn.on("close", () => {
@@ -153,6 +193,192 @@
     connection.send(outgoing);
     messages.push({ sender: "self", text: outgoing });
     messageText = "";
+  }
+
+  function clearChat() {
+    messages = [];
+    copiedMessageIndex = null;
+  }
+
+  function handlePeerData(data: unknown) {
+    if (!isPeerPayload(data)) {
+      messages.push({ sender: "peer", text: String(data) });
+      return;
+    }
+
+    if (typeof data === "string") {
+      messages.push({ sender: "peer", text: data });
+      return;
+    }
+
+    if (data.kind === "file-start") {
+      const messageIndex = messages.length;
+
+      messages.push({
+        sender: "peer",
+        text: `File: ${data.file.name}`,
+        file: { ...data.file, dataUrl: "" },
+        uploadProgress: 0,
+      });
+      incomingTransfers.set(data.id, {
+        messageIndex,
+        chunks: [],
+        file: data.file,
+      });
+      return;
+    }
+
+    if (data.kind === "file-chunk") {
+      const transfer = incomingTransfers.get(data.id);
+
+      if (!transfer) return;
+
+      transfer.chunks.push(data.chunk);
+      updateMessage(transfer.messageIndex, {
+        uploadProgress: Math.max(
+          1,
+          Math.round((data.loaded / data.total) * 100),
+        ),
+      });
+      return;
+    }
+
+    if (data.kind === "file-end") {
+      const transfer = incomingTransfers.get(data.id);
+
+      if (!transfer) return;
+
+      const blob = new Blob(transfer.chunks, { type: transfer.file.type });
+      updateMessage(transfer.messageIndex, {
+        file: {
+          ...transfer.file,
+          dataUrl: URL.createObjectURL(blob),
+        },
+        uploadProgress: undefined,
+      });
+      incomingTransfers.delete(data.id);
+    }
+  }
+
+  function updateMessage(index: number, patch: Partial<Message>) {
+    if (!messages[index]) return;
+
+    messages[index] = { ...messages[index], ...patch };
+    messages = [...messages];
+  }
+
+  function isPeerPayload(data: unknown): data is PeerPayload {
+    return (
+      typeof data === "string" ||
+      (typeof data === "object" &&
+        data !== null &&
+        "kind" in data &&
+        (data.kind === "file-start" ||
+          data.kind === "file-chunk" ||
+          data.kind === "file-end"))
+    );
+  }
+
+  function createTransferId() {
+    return crypto.randomUUID?.() ?? Math.random().toString(36).slice(2);
+  }
+
+  function isFilePayload(
+    data: unknown,
+  ): data is Extract<PeerPayload, { kind: "file-start" }> {
+    return (
+      typeof data === "object" &&
+      data !== null &&
+      "kind" in data &&
+      data.kind === "file-start" &&
+      "file" in data
+    );
+  }
+
+  function formatFileSize(size: number) {
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+    return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  function chooseFile() {
+    fileInput?.click();
+  }
+
+  async function sendFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+
+    if (!connection || !file) return;
+
+    const transferId = createTransferId();
+    const messageIndex = messages.length;
+    const pendingFile = {
+      name: file.name,
+      type: file.type || "application/octet-stream",
+      size: file.size,
+      dataUrl: "",
+    };
+
+    messages.push({
+      sender: "self",
+      text: `File: ${file.name}`,
+      file: pendingFile,
+      uploadProgress: 0,
+    });
+
+    const buffer = await file.arrayBuffer();
+    const blobUrl = URL.createObjectURL(file);
+    const fileMessage = {
+      name: file.name,
+      type: file.type || "application/octet-stream",
+      size: file.size,
+      dataUrl: blobUrl,
+    };
+
+    connection.send({
+      kind: "file-start",
+      id: transferId,
+      file: {
+        name: file.name,
+        type: file.type || "application/octet-stream",
+        size: file.size,
+      },
+    } satisfies PeerPayload);
+
+    for (let offset = 0; offset < buffer.byteLength; offset += fileChunkSize) {
+      const nextOffset = Math.min(offset + fileChunkSize, buffer.byteLength);
+      const chunk = buffer.slice(offset, nextOffset);
+
+      connection.send({
+        kind: "file-chunk",
+        id: transferId,
+        chunk,
+        loaded: nextOffset,
+        total: buffer.byteLength,
+      } satisfies PeerPayload);
+      updateMessage(messageIndex, {
+        uploadProgress: Math.max(
+          1,
+          Math.round((nextOffset / buffer.byteLength) * 100),
+        ),
+      });
+    }
+
+    connection.send({
+      kind: "file-end",
+      id: transferId,
+    } satisfies PeerPayload);
+    updateMessage(messageIndex, {
+      file: fileMessage,
+      uploadProgress: 100,
+    });
+    setTimeout(() => {
+      if (messages[messageIndex]?.file?.dataUrl === blobUrl) {
+        updateMessage(messageIndex, { uploadProgress: undefined });
+      }
+    }, 600);
+    input.value = "";
   }
 
   onDestroy(() => {
@@ -259,7 +485,19 @@
     </aside>
 
     <section class="chat-panel" aria-label="Messages">
-      <p class="copy-note">Click a received message to copy it.</p>
+      <div class="copy-note">
+        <span>Click a received text message to copy it.</span>
+        <button
+          class="ghost-button clear-chat-button"
+          type="button"
+          onclick={clearChat}
+          disabled={messages.length === 0}
+          aria-label="Clear chat"
+          title="Clear chat"
+        >
+          <span aria-hidden="true">⌫</span>
+        </button>
+      </div>
 
       <div class="chat-window" aria-live="polite">
         {#if messages.length === 0}
@@ -273,7 +511,7 @@
           </div>
         {:else}
           {#each messages as msg, index}
-            {#if msg.sender === "peer"}
+            {#if msg.sender === "peer" && !msg.file}
               <button
                 class="message peer"
                 type="button"
@@ -287,7 +525,51 @@
               </button>
             {:else}
               <article class={`message ${msg.sender}`}>
-                <p>{msg.text}</p>
+                {#if msg.file}
+                  <svelte:element
+                    this={msg.file.dataUrl ? "a" : "div"}
+                    class="file-message"
+                    href={msg.file.dataUrl || undefined}
+                    download={msg.file.dataUrl ? msg.file.name : undefined}
+                  >
+                    <span
+                      class:pending-file-icon={!msg.file.dataUrl}
+                      aria-hidden="true"
+                    >
+                      {#if msg.file.dataUrl}
+                        <svg viewBox="0 0 24 24" focusable="false">
+                          <path d="M12 3v11" />
+                          <path d="m7 10 5 5 5-5" />
+                          <path d="M5 21h14" />
+                        </svg>
+                      {:else}
+                        <svg viewBox="0 0 24 24" focusable="false">
+                          <path d="M12 3a9 9 0 1 0 9 9" />
+                        </svg>
+                      {/if}
+                    </span>
+                    <span>
+                      <strong>{msg.file.name}</strong>
+                      <small>
+                        {#if msg.uploadProgress !== undefined}
+                          {msg.sender === "peer" ? "Retrieving" : "Uploading"}, {msg.uploadProgress}%
+                        {:else}
+                          {formatFileSize(msg.file.size)}
+                        {/if}
+                      </small>
+                    </span>
+                  </svelte:element>
+                  {#if msg.uploadProgress !== undefined}
+                    <div
+                      class="upload-progress"
+                      aria-label={`${msg.sender === "peer" ? "Retrieving" : "Uploading"} ${msg.file.name}: ${msg.uploadProgress}%`}
+                    >
+                      <span style={`width: ${msg.uploadProgress}%`}></span>
+                    </div>
+                  {/if}
+                {:else}
+                  <p>{msg.text}</p>
+                {/if}
               </article>
             {/if}
           {/each}
@@ -312,12 +594,32 @@
           disabled={connectionState !== "connected"}
           autocomplete="off"
         />
+        <input
+          class="file-input"
+          type="file"
+          bind:this={fileInput}
+          onchange={sendFile}
+          disabled={connectionState !== "connected"}
+          aria-label="Choose file to send"
+        />
         <button
-          class="primary-button"
+          class="ghost-button message-action"
+          type="button"
+          onclick={chooseFile}
+          disabled={connectionState !== "connected"}
+          aria-label="Upload file"
+          title="Upload file"
+        >
+          <span aria-hidden="true">⇧</span>
+        </button>
+        <button
+          class="primary-button message-action"
           type="submit"
           disabled={connectionState !== "connected" || !messageText.trim()}
+          aria-label="Send message"
+          title="Send message"
         >
-          Send
+          <span aria-hidden="true">↗</span>
         </button>
       </form>
     </section>
@@ -719,14 +1021,37 @@
   }
 
   .copy-note {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
     margin: 0;
-    padding: 10px 18px;
+    padding: 8px 10px 8px 18px;
     border-bottom: 4px solid var(--chat-border);
     background: var(--copy-note-bg);
     color: var(--copy-note-text);
     font-size: 0.82rem;
     font-weight: 950;
     text-transform: uppercase;
+  }
+
+  .copy-note > span:first-child {
+    min-width: 0;
+  }
+
+  .clear-chat-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    min-width: 38px;
+    min-height: 34px;
+    padding: 0;
+  }
+
+  .clear-chat-button span {
+    font-size: 1rem;
+    line-height: 1;
   }
 
   .chat-window {
@@ -835,6 +1160,78 @@
     overflow-wrap: anywhere;
   }
 
+  .file-message {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .file-message > span:first-child {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border: 2px solid currentColor;
+    font-weight: 950;
+  }
+
+  .file-message svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+    stroke-width: 2.5;
+  }
+
+  .pending-file-icon svg {
+    animation: file-spin 900ms linear infinite;
+    transform-origin: center;
+  }
+
+  @keyframes file-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .file-message strong,
+  .file-message small {
+    display: block;
+  }
+
+  .file-message strong {
+    max-width: 28ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .file-message small {
+    margin-top: 2px;
+    font-size: 0.76rem;
+    font-weight: 750;
+    opacity: 0.72;
+  }
+
+  .upload-progress {
+    height: 8px;
+    margin-top: 12px;
+    border: 2px solid currentColor;
+    background: color-mix(in oklch, currentColor 14%, transparent);
+    overflow: hidden;
+  }
+
+  .upload-progress span {
+    display: block;
+    height: 100%;
+    background: currentColor;
+    transition: width 160ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
   .message-hint {
     position: absolute;
     right: -3px;
@@ -863,6 +1260,36 @@
 
   .message-form input {
     min-height: 48px;
+  }
+
+  .file-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .file-input:disabled {
+    opacity: 0;
+  }
+
+  .message-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    min-width: 48px;
+    padding-inline: 0;
+  }
+
+  .message-action span {
+    font-size: 1.18rem;
+    line-height: 1;
   }
 
   .sr-only {
